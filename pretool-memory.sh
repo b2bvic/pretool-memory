@@ -8,8 +8,7 @@
 #   PreToolUse fires → extract thinking → hash check → QMD search →
 #   ledger search → inject combined context
 #
-# Performance: ~200ms avg (BM25 keyword search, no embedding needed)
-# Budget: <500ms (synchronous hook — blocks tool execution until complete)
+# The hook is synchronous. Search latency depends on local hardware and index size.
 #
 # REQUIRES: QMD (https://github.com/aethermonkey/qmd) installed and indexed.
 # If QMD is not available, vault search is skipped.
@@ -24,6 +23,11 @@ INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // "default"' 2>/dev/null)
+
+# ===== CONFIGURATION =====
+STATE_DIR="${PRETOOL_MEMORY_STATE_DIR:-/tmp/claude-memory}"
+THROTTLE_SECONDS="${PRETOOL_THROTTLE_SECONDS:-30}"
+MIN_THINKING_CHARS="${PRETOOL_MIN_THINKING_CHARS:-100}"
 
 # ===== TOOL FILTER =====
 # Only fire for read-oriented tools where Claude is gathering context.
@@ -49,14 +53,14 @@ THINKING=$(tail -200 "$TRANSCRIPT_PATH" 2>/dev/null | \
   tail -c 1500)
 
 # Need enough thinking to form a meaningful query
-if [ -z "$THINKING" ] || [ ${#THINKING} -lt 100 ]; then
+if [ -z "$THINKING" ] || [ ${#THINKING} -lt "$MIN_THINKING_CHARS" ]; then
   exit 0
 fi
 
 # ===== TIME-BASED THROTTLE (30s) =====
 # Prevents token bloat from rapid-fire tool calls in the same reasoning arc.
 # The hash dedup below handles content dedup; this handles temporal dedup.
-HASH_DIR="/tmp/claude-memory"
+HASH_DIR="$STATE_DIR"
 mkdir -p "$HASH_DIR" 2>/dev/null
 THROTTLE_FILE="$HASH_DIR/${SESSION_ID}.last_fire"
 
@@ -64,7 +68,7 @@ if [ -f "$THROTTLE_FILE" ]; then
   LAST_FIRE=$(cat "$THROTTLE_FILE" 2>/dev/null)
   NOW=$(date +%s)
   ELAPSED=$(( NOW - LAST_FIRE ))
-  if [ "$ELAPSED" -lt 30 ]; then
+  if [ "$ELAPSED" -lt "$THROTTLE_SECONDS" ]; then
     exit 0
   fi
 fi
@@ -94,16 +98,20 @@ fi
 # ===== QUERY QMD (BM25 ~166ms) =====
 # Try common install locations. If QMD isn't found, skip vault search.
 QMD_BIN=""
-for candidate in \
-  "$HOME/.bun/bin/qmd" \
-  "$HOME/.local/bin/qmd" \
-  "/usr/local/bin/qmd" \
-  "$(command -v qmd 2>/dev/null)"; do
-  if [ -x "$candidate" ]; then
-    QMD_BIN="$candidate"
-    break
-  fi
-done
+if [ -n "${PRETOOL_QMD_BIN:-}" ] && [ -x "$PRETOOL_QMD_BIN" ]; then
+  QMD_BIN="$PRETOOL_QMD_BIN"
+elif [ "${PRETOOL_DISABLE_QMD:-0}" != "1" ]; then
+  for candidate in \
+    "$HOME/.bun/bin/qmd" \
+    "$HOME/.local/bin/qmd" \
+    "/usr/local/bin/qmd" \
+    "$(command -v qmd 2>/dev/null)"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      QMD_BIN="$candidate"
+      break
+    fi
+  done
+fi
 
 QMD_HIT=0
 RESULTS=""
@@ -121,7 +129,7 @@ LEDGER_DB="${LEDGER_DB:-$HOME/.claude/session-ledger.db}"
 LEDGER_RESULTS=""
 LEDGER_HIT=0
 
-if [ -f "$LEDGER_DB" ]; then
+if [ "${PRETOOL_DISABLE_LEDGER:-0}" != "1" ] && [ -f "$LEDGER_DB" ]; then
   # Sanitize query for FTS5: strip operators, quotes, parens
   FTS_QUERY=$(echo "$QUERY" | sed 's/["(){}*^~]/ /g' | tr -s ' ' | head -c 200)
 

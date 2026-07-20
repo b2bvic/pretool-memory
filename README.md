@@ -1,132 +1,88 @@
 # pretool-memory
 
-Vault-based memory recall for Claude Code. Your vault is the brain. This hook makes Claude read it before every tool call.
+Local memory recall for Claude Code before read-oriented tool calls.
 
-## What it does
+`pretool-memory.sh` reads the latest thinking block from Claude Code's JSONL transcript, builds a bounded query, searches a local Markdown index and optional session ledger, then injects matching context into the current turn. It exits successfully and emits nothing when it cannot retrieve useful context, so memory failure does not block the underlying tool.
 
-Claude Code forgets everything between sessions. This hook gives it memory by searching your Obsidian vault (or any markdown folder) before every tool call and injecting relevant context into the conversation.
+## The control path
 
-Claude is about to read a file? The hook checks your vault for related content first. Claude is about to search? The hook surfaces what you've already found. The context arrives before the tool fires, so Claude's next action is informed by everything you've already written.
-
-## How it works
-
+```text
+PreToolUse JSON
+  -> allowlisted read tool
+  -> transcript tail
+  -> minimum useful thinking block
+  -> per-session time throttle
+  -> content-hash deduplication
+  -> QMD BM25 and optional SQLite FTS5
+  -> hookSpecificOutput.additionalContext
 ```
-Claude thinks → PreToolUse hook fires → extract last thinking block →
-hash-check for dedup → query vault via QMD (BM25, ~200ms) →
-query session ledger via FTS5 (~30ms, optional) →
-inject combined context → Claude proceeds
+
+The implementation is one Bash script. It uses no cloud service and no API key.
+
+## Verify it
+
+```bash
+bash -n pretool-memory.sh install.sh tests/test_pretool_memory.sh
+bash tests/test_pretool_memory.sh
 ```
 
-One shell script. No API keys. No cloud. No database server. Runs locally against your markdown files.
+The contract tests use a temporary transcript, state directory, and deterministic fake QMD executable. They cover:
+
+- unsupported tools and missing transcripts
+- malformed hook input
+- successful context injection
+- time throttling and content deduplication
+- missing retrieval backends
 
 ## Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/b2bvic/pretool-memory/main/install.sh | bash
+git clone https://github.com/b2bvic/pretool-memory.git
+cd pretool-memory
+bash install.sh
 ```
 
-Or manually:
-
-```bash
-# Copy the hook
-mkdir -p ~/.claude/hooks
-cp pretool-memory.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/pretool-memory.sh
-
-# Index your vault
-cd /path/to/your/vault
-qmd collection add .
-
-# Add to Claude Code settings
-# In ~/.claude/settings.json, add under "hooks":
-```
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/pretool-memory.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+Then index the Markdown directory you want QMD to search and add the hook to Claude Code's `PreToolUse` configuration. See the settings fragment printed by `install.sh`.
 
 ## Requirements
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (any plan)
-- [QMD](https://github.com/aethermonkey/qmd) for vault search (the hook exits silently without it)
-- `jq` for JSON parsing
-- A folder of markdown files (Obsidian vault, Zettelkasten, notes directory — any structure)
-- Optional: [session-ledger](https://github.com/b2bvic/session-ledger) for cross-session history search
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+- `bash` and `jq`
+- [QMD](https://github.com/aethermonkey/qmd) with a local collection
+- Optional: [session-ledger](https://github.com/b2bvic/session-ledger) and `sqlite3`
 
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│ Claude Code Session                      │
-│                                          │
-│  Claude thinks...                        │
-│       ↓                                  │
-│  PreToolUse fires                        │
-│       ↓                                  │
-│  ┌──────────────────────────┐            │
-│  │ pretool-memory.sh        │            │
-│  │  1. Read transcript tail │            │
-│  │  2. Extract thinking     │            │
-│  │  3. Hash check (dedup)   │            │
-│  │  4. Time check (30s)     │            │
-│  │  5. Build search query   │            │
-│  │  6. QMD BM25 search      │ ~200ms     │
-│  │  7. Ledger FTS5 search   │ ~30ms      │
-│  │  8. Inject results       │            │
-│  └──────────────────────────┘            │
-│       ↓                                  │
-│  Tool executes with vault context        │
-└─────────────────────────────────────────┘
-```
-
-## Performance
-
-- QMD BM25 search: ~166ms average
-- Session ledger FTS5: ~30ms average
-- Dedup hash check: <1ms
-- 30-second throttle prevents token bloat during rapid tool calls
-- Content-hash dedup skips identical thinking blocks
-- Fires only on read-oriented tools (Read, Glob, Grep, WebFetch, WebSearch, Task)
-- Skips writes, bash, and self-referential QMD calls
-- Total budget: <500ms (synchronous hook)
+Without QMD or a compatible ledger database, the hook exits silently.
 
 ## Configuration
 
-| Variable | Default | What it does |
-|----------|---------|--------------|
-| `LEDGER_DB` | `~/.claude/session-ledger.db` | Session ledger database path |
-| Throttle | 30s | Minimum time between fires. Edit line 68. |
-| Query length | 300 chars | Max search query from thinking block. Edit line 91. |
-| Results | 3 | Number of vault matches returned. Edit line 109. |
-| Min score | 0.3 | BM25 relevance threshold. Edit line 109. |
-| Tool filter | Read,Glob,Grep,WebFetch,WebSearch,Task | Which tools trigger the hook. Edit line 33-37. |
+| Environment variable | Default | Purpose |
+|---|---:|---|
+| `LEDGER_DB` | `~/.claude/session-ledger.db` | Optional SQLite FTS5 database. |
+| `PRETOOL_MEMORY_STATE_DIR` | `/tmp/claude-memory` | Per-session hash and throttle files. |
+| `PRETOOL_THROTTLE_SECONDS` | `30` | Minimum interval between recalls for one session. |
+| `PRETOOL_MIN_THINKING_CHARS` | `100` | Rejects fragments too short to form a useful query. |
+| `PRETOOL_QMD_BIN` | auto-detected | Explicit path to the QMD executable. |
+| `PRETOOL_DISABLE_QMD` | `0` | Set to `1` to suppress QMD lookup. |
+| `PRETOOL_DISABLE_LEDGER` | `0` | Set to `1` to suppress ledger lookup. |
 
-## What this is extracted from
+## Latency boundary
 
-This hook runs inside a larger system — an Obsidian vault with 12,000+ files, 60+ Claude Code skills, semantic search, session ledger with 37,000+ messages, and automated workflows across multiple domains.
+The hook is synchronous, so retrieval latency is added to the tool call. A March 2026 local measurement on the author's machine observed roughly 166 ms for QMD BM25 and 30 ms for SQLite FTS5. Those figures are not a portable benchmark. Corpus size, hardware, index state, and executable startup time will change them.
 
-The vault is the memory. Claude Code is the operator. This hook is the bridge between them.
+The 30-second throttle and content hash reduce repeated work during one reasoning arc. The test suite verifies control flow, not retrieval quality or a latency service level.
 
-If you want the full system built for your business: [scalewithsearch.com](https://scalewithsearch.com)
+## Failure semantics
+
+The script deliberately traps errors and exits zero. That keeps a missing binary, malformed transcript, empty search result, or broken optional ledger from blocking Claude Code. It also means operators need separate health checks if memory retrieval is business-critical.
+
+See [failure modes](docs/FAILURE-MODES.md) and [design decisions](docs/DECISIONS.md).
+
+## Public proof boundary
+
+This repository contains the hook, installer, deterministic contract tests, and design records. It does not contain a private vault, transcript corpus, QMD index, or session ledger. Search relevance depends on the operator's own corpus and index configuration.
 
 ## License
 
 MIT
 
-## Built by
-
-[Victor Valentine Romo](https://b2bvic.com) — [Scale With Search](https://scalewithsearch.com)
+Built by [Victor Valentine Romo](https://b2bvic.com).
