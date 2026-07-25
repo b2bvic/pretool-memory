@@ -1,88 +1,80 @@
 # pretool-memory
 
-Local memory recall for Claude Code before read-oriented tool calls.
+Claude Code hook that injects relevant vault content mid-conversation. Extracts Claude's current thinking from the live transcript, searches your vault, and injects matching context before tool execution.
 
-`pretool-memory.sh` reads the latest thinking block from Claude Code's JSONL transcript, builds a bounded query, searches a local Markdown index and optional session ledger, then injects matching context into the current turn. It exits successfully and emits nothing when it cannot retrieve useful context, so memory failure does not block the underlying tool.
+Built by [Victor Valentine Romo](https://victorvalentineromo.com) at [Scale With Search](https://scalewithsearch.com).
 
-## The control path
+Part of a larger system: this repository proves **P02 (own the memory plane)** and **P03 (continuity compounds)** from the [Seventeen Principles](https://victorvalentineromo.com/principles). The memory being injected lives in plain text you own, and every session starts on the record earlier sessions left.
 
-```text
-PreToolUse JSON
-  -> allowlisted read tool
-  -> transcript tail
-  -> minimum useful thinking block
-  -> per-session time throttle
-  -> content-hash deduplication
-  -> QMD BM25 and optional SQLite FTS5
-  -> hookSpecificOutput.additionalContext
-```
+## What It Does
 
-The implementation is one Bash script. It uses no cloud service and no API key.
+Every time Claude is about to use a tool (Read, Grep, Bash, etc.), this hook fires:
 
-## Verify it
+1. Reads the active JSONL transcript
+2. Extracts the last `thinking` block (what Claude is reasoning about)
+3. Hashes the thinking content to avoid duplicate queries (30s throttle)
+4. Searches your vault via QMD (BM25 keyword search, ~166ms measured on the author's M4 Pro; your hardware will vary)
+5. Optionally queries a session ledger SQLite database (FTS5, ~30ms on the same machine)
+6. Injects matched content as `additionalContext` before the tool runs
 
-```bash
-bash -n pretool-memory.sh install.sh tests/test_pretool_memory.sh
-bash tests/test_pretool_memory.sh
-```
-
-The contract tests use a temporary transcript, state directory, and deterministic fake QMD executable. They cover:
-
-- unsupported tools and missing transcripts
-- malformed hook input
-- successful context injection
-- time throttling and content deduplication
-- missing retrieval backends
+Claude's next action is informed by relevant past sessions and vault content — without you having to manually reference anything.
 
 ## Install
 
 ```bash
-git clone https://github.com/b2bvic/pretool-memory.git
-cd pretool-memory
-bash install.sh
+# Copy the hook
+cp pretool-memory.sh /path/to/your/project/.claude/hooks/
+
+# Make executable
+chmod +x /path/to/your/project/.claude/hooks/pretool-memory.sh
+
+# Add to .claude/settings.json
 ```
 
-Then index the Markdown directory you want QMD to search and add the hook to Claude Code's `PreToolUse` configuration. See the settings fragment printed by `install.sh`.
+Add to your project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pretool-memory.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ## Requirements
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-- `bash` and `jq`
-- [QMD](https://github.com/aethermonkey/qmd) with a local collection
-- Optional: [session-ledger](https://github.com/b2bvic/session-ledger) and `sqlite3`
-
-Without QMD or a compatible ledger database, the hook exits silently.
+- [QMD](https://github.com/aethermonkey/qmd) for vault search (BM25). Install: `bun install -g qmd && qmd index`
+- Optional: [session-ledger](https://github.com/b2bvic/session-ledger) for cross-session search
+- `jq` for JSON output encoding
 
 ## Configuration
 
-| Environment variable | Default | Purpose |
-|---|---:|---|
-| `LEDGER_DB` | `~/.claude/session-ledger.db` | Optional SQLite FTS5 database. |
-| `PRETOOL_MEMORY_STATE_DIR` | `/tmp/claude-memory` | Per-session hash and throttle files. |
-| `PRETOOL_THROTTLE_SECONDS` | `30` | Minimum interval between recalls for one session. |
-| `PRETOOL_MIN_THINKING_CHARS` | `100` | Rejects fragments too short to form a useful query. |
-| `PRETOOL_QMD_BIN` | auto-detected | Explicit path to the QMD executable. |
-| `PRETOOL_DISABLE_QMD` | `0` | Set to `1` to suppress QMD lookup. |
-| `PRETOOL_DISABLE_LEDGER` | `0` | Set to `1` to suppress ledger lookup. |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LEDGER_DB` | `~/.claude/session-ledger.db` | Session ledger database path |
 
-## Latency boundary
+## Performance
 
-The hook is synchronous, so retrieval latency is added to the tool call. A March 2026 local measurement on the author's machine observed roughly 166 ms for QMD BM25 and 30 ms for SQLite FTS5. Those figures are not a portable benchmark. Corpus size, hardware, index state, and executable startup time will change them.
-
-The 30-second throttle and content hash reduce repeated work during one reasoning arc. The test suite verifies control flow, not retrieval quality or a latency service level.
-
-## Failure semantics
-
-The script deliberately traps errors and exits zero. That keeps a missing binary, malformed transcript, empty search result, or broken optional ledger from blocking Claude Code. It also means operators need separate health checks if memory retrieval is business-critical.
-
-See [failure modes](docs/FAILURE-MODES.md) and [design decisions](docs/DECISIONS.md).
-
-## Public proof boundary
-
-This repository contains the hook, installer, deterministic contract tests, and design records. It does not contain a private vault, transcript corpus, QMD index, or session ledger. Search relevance depends on the operator's own corpus and index configuration.
+- QMD BM25 search: ~166ms average
+- Session ledger FTS5: ~30ms average
+- Dedup hash check: <1ms
+- Throttle: 30 seconds between queries (prevents flooding)
+- Total budget: <500ms (synchronous hook)
 
 ## License
 
 MIT
 
-Built by [Victor Valentine Romo](https://b2bvic.com).
+## How this was built
+
+Specification and judgment: human. Implementation: AI models executing that specification under a build contract, with an adversarial audit before publish. The division of labor is the point; see [P07](https://victorvalentineromo.com/principles).
