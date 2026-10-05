@@ -1,48 +1,46 @@
-# pretool-memory
+# Claude Code persistent memory hook: pretool-memory
 
-Claude Code hook that injects relevant vault content mid-conversation. Extracts Claude's current thinking from the live transcript, searches your vault, and injects matching context before tool execution.
+pretool-memory retrieves local search results before selected Claude Code tool calls for operators using hosted Claude models.
+It supplies candidate context from owned records when the current session needs earlier decisions.
 
-Built by [Victor Valentine Romo](https://victorvalentineromo.com) at [Scale With Search](https://scalewithsearch.com).
-
-Part of a larger system: this repository proves **P02 (own the memory plane)** and **P03 (continuity compounds)** from the [Seventeen Principles](https://victorvalentineromo.com/principles). The memory being injected lives in plain text you own, and every session starts on the record earlier sessions left.
-
-## What It Does
-
-Every time Claude is about to use a tool (Read, Grep, Bash, etc.), this hook fires:
-
-1. Reads the active JSONL transcript
-2. Extracts the last `thinking` block (what Claude is reasoning about)
-3. Hashes the thinking content to avoid duplicate queries (30s throttle)
-4. Searches your vault via QMD (BM25 keyword search, ~166ms measured on the author's M4 Pro; your hardware will vary)
-5. Optionally queries a session ledger SQLite database (FTS5, ~30ms on the same machine)
-6. Injects matched content as `additionalContext` before the tool runs
-
-Claude's next action is informed by relevant past sessions and vault content — without you having to manually reference anything.
+[Project page](https://scalewithsearch.com/code/pretool-memory)
 
 ## Install
 
-```bash
-# Copy the hook
-cp pretool-memory.sh /path/to/your/project/.claude/hooks/
+Requirements: Bash, `jq`, `shasum`, and a configured [QMD](https://github.com/tobi/qmd) Markdown collection.
+Optional SQLite FTS5 session recall requires `sqlite3` and a compatible `fts_unified` table.
 
-# Make executable
-chmod +x /path/to/your/project/.claude/hooks/pretool-memory.sh
-
-# Add to .claude/settings.json
+```sh
+git clone https://github.com/b2bvic/pretool-memory.git
+cd pretool-memory
 ```
 
-Add to your project's `.claude/settings.json`:
+The quick start also requires Python 3.
+It uses synthetic search output and needs no QMD installation or model credentials.
+
+## Quick start
+
+```sh
+bash examples/demo.sh
+```
+
+The demo builds a synthetic transcript and supplies a mock QMD executable.
+It prints `PreToolUse` JSON with a sample `additionalContext` value.
+Its temporary files are removed when the demo exits.
+
+For real use, copy `pretool-memory.sh` into your project's `.claude/hooks/` directory.
+Merge this opt-in entry into `.claude/settings.json` after reviewing the corpus:
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "",
+        "matcher": "Read|Glob|Grep|WebFetch|WebSearch|Task",
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pretool-memory.sh"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/pretool-memory.sh\""
           }
         ]
       }
@@ -51,30 +49,70 @@ Add to your project's `.claude/settings.json`:
 }
 ```
 
-## Requirements
+Use the [Claude Code hook reference](https://code.claude.com/docs/en/hooks) when merging existing settings.
 
-- [QMD](https://github.com/aethermonkey/qmd) for vault search (BM25). Install: `bun install -g qmd && qmd index`
-- Optional: [session-ledger](https://github.com/b2bvic/session-ledger) for cross-session search
-- `jq` for JSON output encoding
+## How it works
 
-## Configuration
+AI agent memory retrieval follows a bounded transcript tail:
+
+1. Filter calls to `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, or `Task`.
+2. Read the last 200 transcript lines and retain up to 1,500 bytes of thinking text.
+3. Skip short thinking, recent queries, and repeated thinking hashes.
+4. Use QMD `search` for BM25 context retrieval with at most three results.
+5. Query an optional SQLite ledger for at most two history snippets.
+6. Emit the matches as `additionalContext`.
+
+The hook uses a 30-second per-session throttle after a successful recall.
+Session IDs become SHA-256 cache keys.
+Search failures yield no result from that source; the other source can still supply context.
 
 | Variable | Default | Purpose |
-|----------|---------|---------|
-| `LEDGER_DB` | `~/.claude/session-ledger.db` | Session ledger database path |
+|---|---|---|
+| `QMD_BIN` | `~/.bun/bin/qmd` | QMD executable or scoped search wrapper |
+| `LEDGER_DB` | `~/.claude/session-ledger.db` | Optional SQLite ledger |
+| `MEMORY_STATE_DIR` | `${XDG_CACHE_HOME:-$HOME/.cache}/pretool-memory` | Hash and throttle files |
 
-## Performance
+## Portability
 
-- QMD BM25 search: ~166ms average
-- Session ledger FTS5: ~30ms average
-- Dedup hash check: <1ms
-- Throttle: 30 seconds between queries (prevents flooding)
-- Total budget: <500ms (synchronous hook)
+Memory resides in the source Markdown collection and optional SQLite ledger.
+The export path is your collection directory and the database selected by `LEDGER_DB`.
+The hook supplies no export command and does not create a ledger.
+
+When changing model vendors, carry the original Markdown files and a consistent SQLite backup.
+Rebuild the search index from those records and configure the next client's retrieval adapter.
+The supplied `PreToolUse` adapter and thinking extraction target Claude Code.
+Moving records does not make this hook compatible with another client.
+
+## Limits
+
+- Recall needs a readable transcript with an assistant thinking block of at least 100 characters.
+- Hidden or absent thinking produces no recall.
+- Retrieval can miss records or return unsuitable context.
+- Write, Edit, and Bash calls do not trigger recall.
+- Search has no internal wall-clock timeout or measured latency guarantee.
+- The ledger schema must contain `domain`, `timestamp`, and `content_text` in `fts_unified`.
+- Retrieved text remains untrusted evidence and can enter a hosted-model session.
+- The hook returns success without acting as an approval gate.
+
+## Verify
+
+```sh
+python3 -m unittest discover -s tests -v
+bash -n pretool-memory.sh examples/demo.sh
+shellcheck pretool-memory.sh examples/demo.sh
+ruff check --select F,E9 tests
+```
+
+Tests use synthetic transcripts, a mock QMD command, and a temporary SQLite database.
+Install ShellCheck and Ruff 0.16.10 for lint.
+
+## Related repositories
+
+- [owned-record](https://github.com/b2bvic/owned-record): Markdown context folders and routing configuration.
+- [vault-crawl](https://github.com/b2bvic/vault-crawl): Retrieve source material and preserve provenance.
+- [cc-bridge](https://github.com/b2bvic/cc-bridge): Convert transcript exchanges to Markdown logs.
+- [voice-calibration](https://github.com/b2bvic/voice-calibration): Recall writing samples for a target file genre.
 
 ## License
 
-MIT
-
-## How this was built
-
-Specification and judgment: human. Implementation: AI models executing that specification under a build contract, with an adversarial audit before publish. The division of labor is the point; see [P07](https://victorvalentineromo.com/principles).
+MIT. See [LICENSE](LICENSE).
